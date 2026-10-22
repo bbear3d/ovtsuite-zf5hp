@@ -216,3 +216,270 @@ def test_temp_comp_group_pairs_across_relocated_layout():
     assert len(grp(at)) == 12 and len(grp(ah)) == 12
     assert all((e.rows, e.cols) == (5, 6) for e in grp(at))
     assert all(at.counterpart(ah, e) is not None for e in grp(at))
+
+
+def test_byteswapped_5hp_import_identifies_and_builds_maps(tmp_path):
+    """A 16-bit byte-swapped 5HP read imported into a project must identify as
+    zf5hp (not 'unknown'), so its module engages and builds the structural maps.
+    Before the fix the member was stored platform 'unknown': the module never
+    ran, so an auto-attached sidecar definition was applied *instead of* the
+    maps and -- in the wrong byte order -- placed nothing, showing 0 maps."""
+    import pytest
+    if not os.path.exists(_NATIVE):
+        pytest.skip("5HP24 deswapped reference not present")
+    from ovtsuite.platforms import zf5hp as P
+    native = _native()
+    swapped = P.swap16(native)
+    assert P.byte_swapped(swapped)
+    f = tmp_path / "RS6_read.bin"
+    f.write_bytes(swapped)
+
+    from ovtsuite.project.project import Project
+    from ovtsuite.project import importers, sessionbridge as _sb
+    from ovtsuite.session import TunerSession
+    proj = Project("t")
+    _p, s = importers.import_file(str(f), proj)
+    assert s.platform == "zf5hp", "byte-swapped 5HP must not import as 'unknown'"
+    main = _sb._main_member(proj, s.id)
+    assert main.platform == "zf5hp"
+
+    # opening the set builds the structural maps (the bytes are kept swapped and
+    # deswapped on open; save writes them back swapped)
+    state = proj.head_state(s.id)
+    ext, blob = _sb.working_file(proj, s.id, state)
+    wf = tmp_path / ("work" + ext)
+    wf.write_bytes(blob)
+    sess = TunerSession(str(wf))
+    assert sess.platform == "zf5hp"
+    assert getattr(sess, "support", "") == "full"
+    assert len(sess.entities) >= 80        # structural maps present
+
+
+def test_kp_authored_byteswapped_places_on_native():
+    """A KP authored in WinOLS from a 16-bit byte-swapped read (little-endian
+    interpretation) auto-places on the native big-endian 5HP image: placement
+    tries the swapped byte order, finds the better fit, and flips the
+    definition's endian so values read right. Before the fix it placed 0 and
+    reported 'stored in the other byte order'."""
+    import pytest
+    kp_path = os.path.join(ROOT, "Reference", "Binaries", "ZF5HP24",
+                           "Definitions", "4B0927156FB_RS6_5HP24.kp")
+    if not (os.path.exists(kp_path) and os.path.exists(_NATIVE)):
+        pytest.skip("RS6 5HP24 KP / native reference not present")
+    from ovtsuite import xdf_session as X
+    with open(kp_path, "rb") as fh:
+        kp = fh.read()
+    defn, pl = X.placed_definition(kp, "kp", _native())
+    assert pl.confirmed > 0, "KP should confirm tables via the swapped order"
+    assert defn.byte_order() == ">", "endian flipped to the native image's order"
+    # relocated() returns the placed tables; most of the 162 land
+    assert len(defn.tables) >= 100
+    # and their values read sane (not byte-swapped garbage) on the native image
+    from ovtsuite.binary import BinaryFile
+    bf = BinaryFile.from_bytes(_native(), "rs6.bin", endian=">")
+    ents = X.entities(defn, bf)
+    sample = next((e for e in ents if e.rows * e.cols >= 4), None)
+    assert sample is not None
+    flat = [v for row in sample.values() for v in row]
+    assert all(abs(v) < 1e6 for v in flat)      # no wrong-endian blow-ups
+
+
+def test_256k_5hp19_variant_builds_maps():
+    """The 256 KiB 5HP19 generation (AM29F200, BT010204, no -CODE- tag, data
+    block at 0x36C00, ident at ~0x3BF80 -- e.g. A6 C5 2.5 TDI 4B0927156BG) is
+    size-aware: detection, identification and the self-describing map scan all
+    adapt to the 256 KiB layout. Checksum is not yet mapped for this size and
+    declines gracefully."""
+    import pytest
+    ref = os.path.join(ROOT, "Reference", "Binaries", "ZF5HP19",
+                       "4B0927156BG_A6_2.5TDI_256k_deswapped.bin")
+    if not os.path.exists(ref):
+        pytest.skip("256K 5HP19 reference not present")
+    from ovtsuite.platforms import zf5hp as P
+    from ovtsuite.session import TunerSession
+    from ovtsuite.modules import registry
+    with open(ref, "rb") as fh:
+        native = fh.read()
+    assert len(native) == 0x40000 and P.detect(native)
+    assert P.byte_swapped(P.swap16(native))        # swap round-trips at 256K too
+    s = TunerSession(ref)
+    assert s.platform == "zf5hp"
+    assert s.binary_identity.facts.get("family") == "5HP19"
+    assert s.binary_identity.facts.get("part") == "4B0927156BG"
+    assert len(s.entities) >= 40                   # ~50 self-describing tables
+    # checksum is not worked out for the 256K layout yet -> declines, not crash
+    assert registry.checksum("zf5hp").is_supported(native) is False
+
+# --------------------------------------------------------------------------
+# Full-device read path (K-line KWP2000 readMemoryByAddress) -- mocked link.
+# --------------------------------------------------------------------------
+class _Msg:
+    def __init__(self, body):
+        self.body = bytes(body)
+
+
+class _FakeLink:
+    def __init__(self):
+        self.woken = None
+
+    def wake_up(self, address=0x01):
+        self.woken = address
+        return 0x2000
+
+
+class _FakeKwp:
+    """Serves readMemoryByAddress with per-byte data (value = address & 0xFF),
+    records every 0x23 request, and can NAK out-of-range / demand unlock."""
+
+    def __init__(self, nak_from=None, lock_below=None):
+        self.k = _FakeLink()
+        self.controller = 0x01
+        self.reqs = []
+        self.unlocked = False
+        self.nak_from = nak_from
+        self.lock_below = lock_below
+
+    def send_receive(self, sid, body=b""):
+        from ovtsuite.flash.kwp import NegativeResponse
+        if sid == 0x10:
+            return _Msg([0x85])
+        if sid == 0x82:
+            return _Msg([])
+        if sid == 0x1A:
+            return _Msg(b"\x9B4B0927156FK\x00")
+        if sid == 0x27:
+            if body[:1] == b"\x01":
+                return _Msg(b"\x01\x11\x22\x33\x44")
+            self.unlocked = True
+            return _Msg(b"\x02")
+        if sid == 0x23:
+            a = (body[0] << 16) | (body[1] << 8) | body[2]
+            n = body[3]
+            self.reqs.append((a, n))
+            if self.nak_from is not None and a >= self.nak_from:
+                raise NegativeResponse(0x23, 0x31)        # requestOutOfRange
+            if (self.lock_below is not None and a < self.lock_below
+                    and not self.unlocked):
+                raise NegativeResponse(0x23, 0x33)        # securityAccessDenied
+            return _Msg(bytes([(a + i) & 0xFF for i in range(n)]))
+        raise AssertionError("unexpected SID 0x%02X" % sid)
+
+
+def _flash_with(fake):
+    from ovtsuite.flash.zf5hp import Zf5hpFlash
+    fl = Zf5hpFlash(_FakeLink(), sa2_tape=b"\x00" * 12)
+    fl.kwp = fake
+    return fl
+
+
+def test_read_image_framing_and_assembly():
+    """readMemoryByAddress is issued as 3-byte address + 1-byte length, chunks
+    tile each span contiguously, and bytes land at their true addresses in a
+    1 MiB image with gaps left 0xFF."""
+    fake = _FakeKwp()
+    fl = _flash_with(fake)
+    spans = [(0x8000, 0x80FF), (0x90080, 0x9017F)]
+    img = fl.read_image(spans=spans, chunk=0x80)
+    assert len(img) == 0x100000
+    assert all(n <= 0x80 for _a, n in fake.reqs)
+    assert fake.reqs[0] == (0x8000, 0x80) and fake.reqs[1] == (0x8080, 0x80)
+    for a in (0x8000, 0x80FF, 0x90080, 0x9017F):
+        assert img[a] == (a & 0xFF)
+    assert img[0x8100] == 0xFF and img[0x00000] == 0xFF    # gaps untouched
+
+
+def test_read_image_auto_unlocks_on_securityAccessDenied():
+    """A region that NAKs 0x33 triggers the SA2 handshake once, then the read
+    succeeds -- no tape-less failure, no second unlock."""
+    fake = _FakeKwp(lock_below=0x100000)
+    fl = _flash_with(fake)
+    import ovtsuite.flash.zf5hp as _Z
+    _orig = _Z.security_key
+    _Z.security_key = lambda tape, seed: b"\x00\x00\x00\x00"   # skip SA2 math
+    try:
+        img = fl.read_image(spans=[(0x8000, 0x80FF)], chunk=0x80, unlock_first=False)
+    finally:
+        _Z.security_key = _orig
+    assert fake.unlocked
+    assert img[0x8000] == 0x00 and img[0x80FF] == (0x80FF & 0xFF)
+
+
+def test_read_image_tolerates_out_of_range_nak():
+    """An out-of-range NAK mid-span keeps the bytes already read, leaves the
+    rest 0xFF, and moves on (never raises) -- the real TCU NAKs past its
+    populated range."""
+    fake = _FakeKwp(nak_from=0x8100)
+    fl = _flash_with(fake)
+    img = fl.read_image(spans=[(0x8000, 0x81FF)], chunk=0x80)
+    assert img[0x8000] == 0x00 and img[0x80FF] == (0x80FF & 0xFF)
+    assert img[0x8100] == 0xFF and img[0x81FF] == 0xFF
+
+
+def test_default_read_spans_cover_the_undumped_upper_half():
+    """The default spans reach the 1 MiB TCU's upper half (0x90000+), where the
+    0x60xxx/0x65xxx calibration bank's consumer code lives -- the whole point
+    of the full read (see zf5hp_batch_and_shift_maps_2026_10_20.md)."""
+    from ovtsuite.flash import zf5hp as Z
+    assert Z.IMAGE_SIZE == 0x100000
+    assert any(start >= 0x90000 for start, _end in Z.READ_SPANS)
+    assert max(end for _s, end in Z.READ_SPANS) == 0xFFFFF
+
+
+def test_read_refuses_a_reply_of_the_wrong_length():
+    """A reply that is not the length asked for (an echoed address, a short
+    block) stops the read rather than shifting the rest of the image."""
+    from ovtsuite.flash.zf5hp import Zf5hpError
+    fake = _FakeKwp()
+    real = fake.send_receive
+
+    def echoing(sid, body=b""):
+        msg = real(sid, body)
+        return _Msg(body[:3] + msg.body) if sid == 0x23 else msg
+    fake.send_receive = echoing
+    fl = _flash_with(fake)
+    with pytest.raises(Zf5hpError):
+        fl.read_image(spans=[(0x8000, 0x80FF)], chunk=0x80)
+
+
+def test_a_short_seed_is_not_taken_as_unlocked():
+    from ovtsuite.flash.zf5hp import Zf5hpError
+    fake = _FakeKwp()
+    real = fake.send_receive
+    fake.send_receive = lambda sid, body=b"": (
+        _Msg(b"\x01") if sid == 0x27 and body[:1] == b"\x01" else real(sid, body))
+    fl = _flash_with(fake)
+    with pytest.raises(Zf5hpError):
+        fl.unlock()
+    assert not fl._unlocked
+
+
+def test_a_failed_handshake_is_not_tried_again_per_region():
+    """One wrong key, not one per locked region: each counts towards the
+    TCU's attempt limit."""
+    from ovtsuite.flash.kwp import NegativeResponse
+    fake = _FakeKwp(lock_below=0x100000)
+    real = fake.send_receive
+    keys = []
+
+    def wrong_key(sid, body=b""):
+        if sid == 0x27 and body[:1] == b"\x02":
+            keys.append(body)
+            raise NegativeResponse(0x27, 0x35)            # invalidKey
+        return real(sid, body)
+    fake.send_receive = wrong_key
+    fl = _flash_with(fake)
+    import ovtsuite.flash.zf5hp as _Z
+    _orig = _Z.security_key
+    _Z.security_key = lambda tape, seed: b"\x00\x00\x00\x00"
+    try:
+        fl.read_image(spans=[(0x8000, 0x80FF), (0x90080, 0x9017F)], chunk=0x80)
+    finally:
+        _Z.security_key = _orig
+    assert len(keys) == 1
+
+
+def test_connect_talks_to_the_init_address():
+    fake = _FakeKwp()
+    fl = _flash_with(fake)
+    fl.connect(init_addr=0x02, session=None)
+    assert fake.controller == 0x02 and fake.k.woken == 0x02

@@ -98,6 +98,24 @@ def build(session, family: Optional[str] = None, progress=None) -> None:
     rep.step("Building the parameter tree")
     from .. import xdf_session
     session.entities = xdf_session.entities(defn, session.binfile)
+    # These are the module's OWN tables, read from the image's self-describing
+    # structure -- NOT an attached definition file. xdf_session.entities tags
+    # every entity it builds source="definition"; left as-is the 5HP maps would
+    # be grouped under "definition file" in the tree AND stripped by the project
+    # snapshot / drop_added_definition (which drops source=="definition", meant
+    # for re-derivable attached definitions) -- so loading a 5HP image into a
+    # project showed no maps. "struct" is the accurate, trusted grade: placed
+    # by reading a self-describing structure.
+    #
+    # xdf_session.entities also files them under tier DEFINITION, whose tree
+    # heading is literally "From the definition file" -- wrong for the module's
+    # own structural maps. Re-file them under the gearbox catch-all ("Other
+    # gearbox maps"): honest, since most are uncharacterised transmission tables
+    # (nothing is claimed about their function).
+    from ..groups import OTHER_GEARBOX as _OTHER_GEARBOX
+    for _e in session.entities:
+        _e.source = "struct"
+        _e.tier = _OTHER_GEARBOX
     _number_families(session.entities)
     session.family_note = (
         "ZF 5HP image (%s): %d self-describing tables found structurally. "

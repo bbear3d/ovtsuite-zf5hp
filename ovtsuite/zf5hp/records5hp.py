@@ -130,7 +130,9 @@ def _found(img: bytes):
     """Yield ``(kind, addr, nx, ny, size)`` for each self-describing map.
     kind in {"map","indexed","matrix"}; curves are not emitted (their 1-D
     signature is too weak without the curve interp routine)."""
-    p, n = CAL_LO, min(CAL_HI, len(img))
+    from ..platforms.zf5hp import cal_range
+    lo, hi = cal_range(img)
+    p, n = lo, min(hi, len(img))
     while p + 4 <= n:
         nx, ny = struct.unpack_from(">HH", img, p)
         if 2 <= nx <= _MAXN and 2 <= ny <= _MAXN:
